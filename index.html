@@ -430,13 +430,86 @@
 // ── State ──
 let currentTab = 'registrar';
 let data = JSON.parse(localStorage.getItem('caminhao_data') || 'null') || {
-  config: { placa: 'CKD2E98', motorista: 'VILSON', kmBase: 100, valorKm: 2, diariaDefault: 460, adiantamento: 0 },
+  config: { placa: 'ABC1D23', motorista: 'MOTORISTA', kmBase: 100, valorKm: 2, diariaDefault: 460, adiantamento: 0 },
   quinzenas: [],
   currentQ: null
 };
 
 function save() {
   localStorage.setItem('caminhao_data', JSON.stringify(data));
+  checkAutoBackup();
+}
+
+function checkAutoBackup() {
+  if (data.config.autoBackup === false) return;
+  
+  const lastBackup = localStorage.getItem('caminhao_last_backup');
+  const now = Date.now();
+  const threeDays = 3 * 24 * 60 * 60 * 1000;
+  
+  if (!lastBackup || (now - parseInt(lastBackup)) > threeDays) {
+    const q = getQ();
+    if (q && q.records.length > 0) {
+      setTimeout(() => {
+        if (confirm('Faz 3 dias que você não fez backup. Enviar backup pelo WhatsApp agora?')) {
+          sendBackupWhatsApp();
+        }
+      }, 500);
+    }
+  }
+}
+
+function toggleAutoBackup() {
+  data.config.autoBackup = document.getElementById('cfgAutoBackup').checked;
+  save();
+  toast(data.config.autoBackup ? 'Backup automático ativado!' : 'Backup automático desativado');
+  render();
+}
+
+function sendBackupWhatsApp() {
+  const q = getQ();
+  const backupData = JSON.stringify(data);
+  const resumo = q ? generateBackupText(q) : 'Sem dados na quinzena atual.';
+  
+  const text = `🚛 BACKUP PLANILHA CAMINHÃO\n📅 ${new Date().toLocaleDateString('pt-BR')} às ${new Date().toLocaleTimeString('pt-BR', {hour:'2-digit',minute:'2-digit'})}\n\n${resumo}\n\n📦 Dados completos (copie tudo abaixo pra restaurar):\n${backupData}`;
+  
+  const url = `https://wa.me/?text=${encodeURIComponent(text)}`;
+  window.open(url, '_blank');
+  localStorage.setItem('caminhao_last_backup', Date.now().toString());
+  toast('Backup enviado!');
+}
+
+function generateBackupText(q) {
+  const completos = q.records.filter(r => !r.parcial);
+  const totalDiarias = completos.reduce((s, r) => s + r.total, 0);
+  const totalDiesel = q.abastecimentos.reduce((s, a) => s + a.valorTotal, 0);
+  const adiantamento = data.config.adiantamento || 0;
+  const valorLiquido = totalDiarias - totalDiesel - adiantamento;
+  
+  return `📋 ${q.label}\n` +
+    `Registros: ${completos.length} completos\n` +
+    `Total diárias: R$ ${totalDiarias.toFixed(2)}\n` +
+    `Total diesel: R$ ${totalDiesel.toFixed(2)}\n` +
+    `Valor líquido: R$ ${valorLiquido.toFixed(2)}`;
+}
+
+function restoreBackup() {
+  const input = prompt('Cole aqui os dados do backup (aquele textão que começa com {):');
+  if (!input) return;
+  try {
+    const restored = JSON.parse(input.trim());
+    if (restored.config && restored.quinzenas) {
+      data = restored;
+      save();
+      updateQuinzenaSelect();
+      render();
+      toast('Backup restaurado!');
+    } else {
+      toast('Dados inválidos!');
+    }
+  } catch(e) {
+    toast('Erro ao restaurar. Verifique se copiou tudo.');
+  }
 }
 
 function getQ() {
@@ -507,7 +580,8 @@ function render() {
 // ── Registrar tab ──
 function renderRegistrar() {
   const q = getQ();
-  const lastKm = q && q.records.length > 0 ? q.records[q.records.length - 1].kmFinal : '';
+  const lastRecord = q && q.records.length > 0 ? q.records[q.records.length - 1] : null;
+  const lastKm = lastRecord ? (lastRecord.kmFinal || lastRecord.kmInicial) : '';
   const today = new Date().toISOString().split('T')[0];
   
   return `
@@ -529,14 +603,10 @@ function renderRegistrar() {
           <input type="number" id="regKmF" placeholder="ex: 45300" inputmode="numeric">
         </div>
       </div>
-      <div class="form-row">
+      <div class="form-row full">
         <div class="form-group">
           <label>Diária (R$)</label>
           <input type="number" id="regDiaria" value="${data.config.diariaDefault}" inputmode="decimal">
-        </div>
-        <div class="form-group">
-          <label>Emp. Caminhão</label>
-          <input type="text" id="regEmp" placeholder="ex: 14/24">
         </div>
       </div>
       <div style="margin-top:4px">
@@ -575,23 +645,25 @@ function addRecord() {
   
   const dateVal = document.getElementById('regData').value;
   const kmI = parseFloat(document.getElementById('regKmI').value);
-  const kmF = parseFloat(document.getElementById('regKmF').value);
+  const kmF = document.getElementById('regKmF').value ? parseFloat(document.getElementById('regKmF').value) : null;
   const diaria = parseFloat(document.getElementById('regDiaria').value);
-  const emp = document.getElementById('regEmp').value;
 
-  if (!dateVal || isNaN(kmI) || isNaN(kmF) || isNaN(diaria)) {
-    toast('Preencha todos os campos!');
+  if (!dateVal || isNaN(kmI)) {
+    toast('Preencha pelo menos a data e o KM inicial!');
     return;
   }
 
-  const kmRodado = kmF - kmI;
-  const kmAdicional = Math.max(0, kmRodado - data.config.kmBase);
-  const valorAdicional = kmAdicional * data.config.valorKm;
-  const total = diaria + valorAdicional;
-
-  q.records.push({ date: dateVal, kmInicial: kmI, kmFinal: kmF, diaria, kmAdicional, valorAdicional, total, emp });
+  if (kmF !== null) {
+    const kmRodado = kmF - kmI;
+    const kmAdicional = Math.max(0, kmRodado - data.config.kmBase);
+    const valorAdicional = kmAdicional * data.config.valorKm;
+    const total = diaria + valorAdicional;
+    q.records.push({ date: dateVal, kmInicial: kmI, kmFinal: kmF, diaria, kmAdicional, valorAdicional, total, parcial: false });
+  } else {
+    q.records.push({ date: dateVal, kmInicial: kmI, kmFinal: null, diaria, kmAdicional: 0, valorAdicional: 0, total: 0, parcial: true });
+  }
   save();
-  toast('Registro salvo!');
+  toast(kmF !== null ? 'Registro salvo!' : 'Registro parcial salvo! Complete o KM final depois.');
   render();
 }
 
@@ -629,12 +701,29 @@ function renderRegistros() {
     q.records.forEach((r, i) => {
       const d = new Date(r.date + 'T12:00:00');
       const dateStr = d.toLocaleDateString('pt-BR', { day:'2-digit', month:'2-digit' });
-      const kmRodado = r.kmFinal - r.kmInicial;
       
-      html += `
+      if (r.parcial) {
+        html += `
+        <div class="record" style="border-color:var(--yellow);border-style:dashed">
+          <div class="record-header">
+            <span class="record-date">${dateStr} <span style="color:var(--yellow)">· Pendente</span></span>
+          </div>
+          <div class="record-details">
+            <div class="record-detail">KM Inicial<strong>${r.kmInicial.toFixed(0)}</strong></div>
+            <div class="record-detail">Diária<strong>R$ ${r.diaria.toFixed(0)}</strong></div>
+            <div class="record-detail">KM Final<strong>—</strong></div>
+          </div>
+          <div class="record-actions">
+            <button class="btn btn-success btn-small" onclick="completeRecord(${i})">Completar</button>
+            <button class="btn btn-danger btn-small" onclick="deleteRecord(${i})">Excluir</button>
+          </div>
+        </div>`;
+      } else {
+        const kmRodado = r.kmFinal - r.kmInicial;
+        html += `
         <div class="record">
           <div class="record-header">
-            <span class="record-date">${dateStr} ${r.emp ? '· ' + r.emp : ''}</span>
+            <span class="record-date">${dateStr}</span>
             <span class="record-total">R$ ${r.total.toFixed(0)}</span>
           </div>
           <div class="record-details">
@@ -646,6 +735,7 @@ function renderRegistros() {
             <button class="btn btn-danger btn-small" onclick="deleteRecord(${i})">Excluir</button>
           </div>
         </div>`;
+      }
     });
   }
 
@@ -684,6 +774,23 @@ function deleteRecord(i) {
   }
 }
 
+function completeRecord(i) {
+  const kmF = prompt('Informe o KM Final:');
+  if (kmF === null) return;
+  const kmFinal = parseFloat(kmF);
+  if (isNaN(kmFinal)) { toast('Valor inválido!'); return; }
+  
+  const r = getQ().records[i];
+  r.kmFinal = kmFinal;
+  const kmRodado = kmFinal - r.kmInicial;
+  r.kmAdicional = Math.max(0, kmRodado - data.config.kmBase);
+  r.valorAdicional = r.kmAdicional * data.config.valorKm;
+  r.total = r.diaria + r.valorAdicional;
+  r.parcial = false;
+  save(); render();
+  toast('Registro completado!');
+}
+
 function deleteFuel(i) {
   if (confirm('Excluir esse abastecimento?')) {
     getQ().abastecimentos.splice(i, 1);
@@ -699,13 +806,19 @@ function renderResumo() {
     return `<div class="empty-state"><div class="icon">📊</div><p>Adicione registros pra ver o resumo da quinzena.</p></div>`;
   }
 
-  const totalDiarias = q.records.reduce((s, r) => s + r.total, 0);
+  const completos = q.records.filter(r => !r.parcial);
+  const pendentes = q.records.filter(r => r.parcial).length;
+  if (completos.length === 0) {
+    return `<div class="empty-state"><div class="icon">📊</div><p>${pendentes > 0 ? 'Você tem registros pendentes. Complete o KM final na aba "Registros" pra ver o resumo.' : 'Adicione registros pra ver o resumo da quinzena.'}</p></div>`;
+  }
+
+  const totalDiarias = completos.reduce((s, r) => s + r.total, 0);
   const totalDiesel = q.abastecimentos.reduce((s, a) => s + a.valorTotal, 0);
   const adiantamento = data.config.adiantamento || 0;
   const valorLiquido = totalDiarias - totalDiesel - adiantamento;
-  const totalRodado = q.records.reduce((s, r) => s + (r.kmFinal - r.kmInicial), 0);
-  const mediaKmAdicional = q.records.reduce((s, r) => s + r.kmAdicional, 0) / q.records.length;
-  const mediaDiaria = totalDiarias / q.records.length;
+  const totalRodado = completos.reduce((s, r) => s + (r.kmFinal - r.kmInicial), 0);
+  const mediaKmAdicional = completos.reduce((s, r) => s + r.kmAdicional, 0) / completos.length;
+  const mediaDiaria = totalDiarias / completos.length;
   const totalLitros = q.abastecimentos.reduce((s, a) => s + a.litros, 0);
   const mediaKmLitro = totalLitros > 0 ? totalRodado / totalLitros : 0;
 
@@ -729,7 +842,7 @@ function renderResumo() {
       </div>
       <div class="summary-item">
         <div class="summary-label">Dias Trabalhados</div>
-        <div class="summary-value">${q.records.length}</div>
+        <div class="summary-value">${completos.length}${pendentes > 0 ? ` <span style="font-size:12px;color:var(--yellow)">(+${pendentes} pendente${pendentes > 1 ? 's' : ''})</span>` : ''}</div>
       </div>
       <div class="summary-item">
         <div class="summary-label">Média KM Adic./Dia</div>
@@ -786,7 +899,7 @@ function gerarPDF() {
   const totalLitros = q.abastecimentos.reduce((s, a) => s + a.litros, 0);
   const mediaKmLitro = totalLitros > 0 ? totalRodado / totalLitros : 0;
 
-  let tableRows = q.records.map(r => {
+  let tableRows = q.records.filter(r => !r.parcial).map(r => {
     const d = new Date(r.date + 'T12:00:00');
     const dateStr = d.toLocaleDateString('pt-BR');
     return `<tr>
@@ -797,7 +910,6 @@ function gerarPDF() {
       <td>${r.kmAdicional}</td>
       <td>R$ ${r.valorAdicional.toFixed(0)}</td>
       <td><strong>R$ ${r.total.toFixed(0)}</strong></td>
-      <td>${r.emp || ''}</td>
     </tr>`;
   }).join('');
 
@@ -836,7 +948,7 @@ function gerarPDF() {
 
     <h2>Registros de Viagem</h2>
     <table>
-      <tr><th>Data</th><th>KM Inicial</th><th>KM Final</th><th>Diária</th><th>KM Adic.</th><th>Valor Adic.</th><th>Total</th><th>Emp.</th></tr>
+      <tr><th>Data</th><th>KM Inicial</th><th>KM Final</th><th>Diária</th><th>KM Adic.</th><th>Valor Adic.</th><th>Total</th></tr>
       ${tableRows}
     </table>
 
@@ -923,6 +1035,27 @@ function renderConfig() {
       <div class="card-title">🗑️ Dados Gerais</div>
       <div style="margin-top:8px">
         <button class="btn btn-danger" onclick="clearAll()">Apagar Todos os Dados</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">💾 Backup</div>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;padding:12px;background:var(--surface2);border-radius:10px;">
+        <div>
+          <div style="font-size:13px;font-weight:600;color:var(--text)">Backup automático</div>
+          <div style="font-size:11px;color:var(--text2)">Avisa a cada 3 dias pra enviar</div>
+        </div>
+        <label style="position:relative;display:inline-block;width:50px;height:28px;cursor:pointer;">
+          <input type="checkbox" id="cfgAutoBackup" ${data.config.autoBackup !== false ? 'checked' : ''} onchange="toggleAutoBackup()" style="opacity:0;width:0;height:0;">
+          <span style="position:absolute;top:0;left:0;right:0;bottom:0;background:${data.config.autoBackup !== false ? 'var(--green)' : 'var(--surface)'};border:1px solid var(--border);border-radius:28px;transition:0.3s;"></span>
+          <span style="position:absolute;top:3px;left:${data.config.autoBackup !== false ? '24px' : '3px'};width:22px;height:22px;background:white;border-radius:50%;transition:0.3s;"></span>
+        </label>
+      </div>
+      <div style="margin-top:8px">
+        <button class="btn btn-primary" onclick="sendBackupWhatsApp()">📱 Enviar Backup pelo WhatsApp</button>
+      </div>
+      <div style="margin-top:8px">
+        <button class="btn btn-secondary" onclick="restoreBackup()">📥 Restaurar Backup</button>
       </div>
     </div>
   `;
