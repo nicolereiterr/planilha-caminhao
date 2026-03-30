@@ -426,7 +426,31 @@
 <div class="content" id="content"></div>
 <div class="toast" id="toast"></div>
 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/firebase/10.12.2/firebase-app-compat.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/firebase/10.12.2/firebase-firestore-compat.min.js"></script>
 <script>
+// ── Firebase ──
+firebase.initializeApp({
+  apiKey: "AIzaSyCWJuFq_weNp3HWzDOhwQLrQHRwe1mK5TI",
+  authDomain: "planilha-caminhao.firebaseapp.com",
+  projectId: "planilha-caminhao",
+  storageBucket: "planilha-caminhao.firebasestorage.app",
+  messagingSenderId: "269215537987",
+  appId: "1:269215537987:web:4641aac66eb80d1de7edf6"
+});
+const db = firebase.firestore();
+
+// Generate or retrieve a unique device ID
+function getDeviceId() {
+  let id = localStorage.getItem('caminhao_device_id');
+  if (!id) {
+    id = 'dev_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+    localStorage.setItem('caminhao_device_id', id);
+  }
+  return id;
+}
+const DEVICE_ID = getDeviceId();
+
 // ── State ──
 let currentTab = 'registrar';
 let data = JSON.parse(localStorage.getItem('caminhao_data') || 'null') || {
@@ -437,15 +461,52 @@ let data = JSON.parse(localStorage.getItem('caminhao_data') || 'null') || {
 
 function save() {
   localStorage.setItem('caminhao_data', JSON.stringify(data));
+  saveToCloud();
   checkAutoBackup();
 }
 
+let cloudSaveTimeout = null;
+function saveToCloud() {
+  if (cloudSaveTimeout) clearTimeout(cloudSaveTimeout);
+  cloudSaveTimeout = setTimeout(() => {
+    db.collection('caminhoes').doc(DEVICE_ID).set({
+      data: JSON.stringify(data),
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+      motorista: data.config.motorista,
+      placa: data.config.placa
+    }).catch(err => console.log('Cloud save failed:', err));
+  }, 2000);
+}
+
+// Load from cloud on first visit (if local is empty)
+async function loadFromCloud() {
+  try {
+    const doc = await db.collection('caminhoes').doc(DEVICE_ID).get();
+    if (doc.exists) {
+      const cloudData = JSON.parse(doc.data().data);
+      const localStr = localStorage.getItem('caminhao_data');
+      if (!localStr || localStr === 'null') {
+        data = cloudData;
+        localStorage.setItem('caminhao_data', JSON.stringify(data));
+        updateQuinzenaSelect();
+        render();
+        toast('Dados restaurados da nuvem!');
+      }
+    }
+  } catch(e) { console.log('Cloud load failed:', e); }
+}
+loadFromCloud();
+
 function checkAutoBackup() {
-  if (data.config.autoBackup === false) return;
+  if (data.config.autoBackup !== true) return;
   
   const lastBackup = localStorage.getItem('caminhao_last_backup');
   const now = Date.now();
   const threeDays = 3 * 24 * 60 * 60 * 1000;
+  
+  // Only check once per session
+  if (window._backupChecked) return;
+  window._backupChecked = true;
   
   if (!lastBackup || (now - parseInt(lastBackup)) > threeDays) {
     const q = getQ();
@@ -462,7 +523,7 @@ function checkAutoBackup() {
 function toggleAutoBackup() {
   data.config.autoBackup = document.getElementById('cfgAutoBackup').checked;
   save();
-  toast(data.config.autoBackup ? 'Backup automático ativado!' : 'Backup automático desativado');
+  toast(data.config.autoBackup ? 'Lembrete automático ativado!' : 'Lembrete automático desativado');
   render();
 }
 
@@ -528,16 +589,43 @@ function toast(msg) {
 function newQuinzena() {
   const now = new Date();
   const day = now.getDate();
-  const month = now.toLocaleString('pt-BR', { month: 'short' }).replace('.','');
+  const month = now.getMonth();
   const year = now.getFullYear();
-  const label = day <= 15 ? `1ª Quinz. ${month} ${year}` : `2ª Quinz. ${month} ${year}`;
+  const monthName = now.toLocaleString('pt-BR', { month: 'short' }).replace('.','');
   
-  data.quinzenas.push({ label, records: [], abastecimentos: [] });
+  let startDay, endDay, label;
+  if (day <= 15) {
+    startDay = 1; endDay = 15;
+    label = `1ª Quinz. ${monthName} ${year} (01-15)`;
+  } else {
+    startDay = 16;
+    endDay = new Date(year, month + 1, 0).getDate();
+    label = `2ª Quinz. ${monthName} ${year} (16-${endDay})`;
+  }
+  
+  data.quinzenas.push({ label, records: [], abastecimentos: [], month: month, year: year, half: day <= 15 ? 1 : 2 });
   data.currentQ = data.quinzenas.length - 1;
   save();
   updateQuinzenaSelect();
   render();
   toast('Nova quinzena criada!');
+}
+
+// Loan calculation: parcela 14 vence 15/abr/2026, 15 vence 15/mai/2026, etc.
+// Only applies to 1st quinzena of each month
+function getParcelaInfo(q) {
+  if (!q || !q.half || q.half !== 1) return null;
+  
+  // Parcela 14 = april 2026 (month 3), parcela 15 = may 2026, etc.
+  const baseMonth = 3; // April = month index 3
+  const baseYear = 2026;
+  const baseParcela = 14;
+  
+  const monthsDiff = (q.year - baseYear) * 12 + (q.month - baseMonth);
+  const parcelaNum = baseParcela + monthsDiff;
+  
+  if (parcelaNum < 1 || parcelaNum > 24) return null;
+  return { numero: parcelaNum, valor: 1306.10, total: 24 };
 }
 
 function switchQuinzena() {
@@ -815,12 +903,18 @@ function renderResumo() {
   const totalDiarias = completos.reduce((s, r) => s + r.total, 0);
   const totalDiesel = q.abastecimentos.reduce((s, a) => s + a.valorTotal, 0);
   const adiantamento = data.config.adiantamento || 0;
-  const valorLiquido = totalDiarias - totalDiesel - adiantamento;
+  const parcela = getParcelaInfo(q);
+  const parcelaValor = parcela ? parcela.valor : 0;
+  const valorLiquido = totalDiarias - totalDiesel - adiantamento - parcelaValor;
   const totalRodado = completos.reduce((s, r) => s + (r.kmFinal - r.kmInicial), 0);
   const mediaKmAdicional = completos.reduce((s, r) => s + r.kmAdicional, 0) / completos.length;
   const mediaDiaria = totalDiarias / completos.length;
   const totalLitros = q.abastecimentos.reduce((s, a) => s + a.litros, 0);
   const mediaKmLitro = totalLitros > 0 ? totalRodado / totalLitros : 0;
+  const fifoKmL = calcFIFOKmL(q);
+
+  // Quinzena selector for PDF
+  const qOptions = data.quinzenas.map((qi, i) => `<option value="${i}" ${i === data.currentQ ? 'selected' : ''}>${qi.label}</option>`).join('');
 
   return `
     <div class="summary-grid">
@@ -854,8 +948,18 @@ function renderResumo() {
       </div>
       ${totalLitros > 0 ? `
       <div class="summary-item">
-        <div class="summary-label">Média KM/Litro</div>
+        <div class="summary-label">Média KM/Litro (simples)</div>
         <div class="summary-value yellow">${mediaKmLitro.toFixed(2)}</div>
+      </div>` : ''}
+      ${fifoKmL !== null ? `
+      <div class="summary-item">
+        <div class="summary-label">Média KM/Litro (FIFO)</div>
+        <div class="summary-value yellow">${fifoKmL.toFixed(2)}</div>
+      </div>` : ''}
+      ${parcela ? `
+      <div class="summary-item">
+        <div class="summary-label">Parcela Caminhão (${parcela.numero}/${parcela.total})</div>
+        <div class="summary-value red">R$ ${parcela.valor.toFixed(2)}</div>
       </div>` : ''}
       ${adiantamento > 0 ? `
       <div class="summary-item">
@@ -864,8 +968,17 @@ function renderResumo() {
       </div>` : ''}
     </div>
 
-    <div style="margin-top:16px">
-      <button class="btn btn-primary" onclick="gerarPDF()">📄 Gerar PDF da Quinzena</button>
+    <div class="card" style="margin-top:16px">
+      <div class="card-title">📄 Gerar PDF</div>
+      <div class="form-row full">
+        <div class="form-group">
+          <label>Quinzena</label>
+          <select id="pdfQuinzena">${qOptions}</select>
+        </div>
+      </div>
+      <div style="margin-top:8px">
+        <button class="btn btn-primary" onclick="gerarPDF(parseInt(document.getElementById('pdfQuinzena').value))">📄 Gerar PDF</button>
+      </div>
     </div>
     <div style="margin-top:8px">
       <div class="form-row">
@@ -878,6 +991,41 @@ function renderResumo() {
   `;
 }
 
+// FIFO km/litro: first fuel in = first fuel consumed
+function calcFIFOKmL(q) {
+  if (!q || q.abastecimentos.length === 0 || q.records.filter(r => !r.parcial).length === 0) return null;
+  
+  const completos = q.records.filter(r => !r.parcial).sort((a,b) => a.date.localeCompare(b.date));
+  const abasts = q.abastecimentos.sort((a,b) => a.date.localeCompare(b.date));
+  
+  // Build fuel queue (FIFO)
+  let fuelQueue = [];
+  abasts.forEach(a => fuelQueue.push({ litros: a.litros, precoLitro: a.precoLitro }));
+  
+  let totalKm = 0;
+  let totalLitrosUsados = 0;
+  
+  completos.forEach(r => {
+    const kmRodado = r.kmFinal - r.kmInicial;
+    totalKm += kmRodado;
+  });
+  
+  // Consume fuel FIFO
+  let kmRemaining = totalKm;
+  let litrosConsumidos = 0;
+  const estimatedKmPerLiter = 2.5; // rough estimate to convert km to liters needed
+  let litrosNeeded = totalKm / estimatedKmPerLiter;
+  
+  // Simpler approach: total km / total liters from FIFO order
+  let totalFifoLitros = 0;
+  for (let i = 0; i < fuelQueue.length && totalFifoLitros < litrosNeeded * 1.5; i++) {
+    totalFifoLitros += fuelQueue[i].litros;
+  }
+  
+  if (totalFifoLitros === 0) return null;
+  return totalKm / totalFifoLitros;
+}
+
 function updateAdiantamento() {
   data.config.adiantamento = parseFloat(document.getElementById('adiantamento').value) || 0;
   save();
@@ -885,21 +1033,26 @@ function updateAdiantamento() {
 }
 
 // ── PDF Generation ──
-function gerarPDF() {
-  const q = getQ();
+function gerarPDF(qIndex) {
+  const qi = qIndex !== undefined ? qIndex : data.currentQ;
+  const q = data.quinzenas[qi];
   if (!q) return;
 
-  const totalDiarias = q.records.reduce((s, r) => s + r.total, 0);
+  const completos = q.records.filter(r => !r.parcial);
+  const totalDiarias = completos.reduce((s, r) => s + r.total, 0);
   const totalDiesel = q.abastecimentos.reduce((s, a) => s + a.valorTotal, 0);
   const adiantamento = data.config.adiantamento || 0;
-  const valorLiquido = totalDiarias - totalDiesel - adiantamento;
-  const totalRodado = q.records.reduce((s, r) => s + (r.kmFinal - r.kmInicial), 0);
-  const mediaKmAdicional = q.records.length > 0 ? q.records.reduce((s, r) => s + r.kmAdicional, 0) / q.records.length : 0;
-  const mediaDiaria = q.records.length > 0 ? totalDiarias / q.records.length : 0;
+  const parcela = getParcelaInfo(q);
+  const parcelaValor = parcela ? parcela.valor : 0;
+  const valorLiquido = totalDiarias - totalDiesel - adiantamento - parcelaValor;
+  const totalRodado = completos.reduce((s, r) => s + (r.kmFinal - r.kmInicial), 0);
+  const mediaKmAdicional = completos.length > 0 ? completos.reduce((s, r) => s + r.kmAdicional, 0) / completos.length : 0;
+  const mediaDiaria = completos.length > 0 ? totalDiarias / completos.length : 0;
   const totalLitros = q.abastecimentos.reduce((s, a) => s + a.litros, 0);
   const mediaKmLitro = totalLitros > 0 ? totalRodado / totalLitros : 0;
+  const fifoKmL = calcFIFOKmL(q);
 
-  let tableRows = q.records.filter(r => !r.parcial).map(r => {
+  let tableRows = completos.map(r => {
     const d = new Date(r.date + 'T12:00:00');
     const dateStr = d.toLocaleDateString('pt-BR');
     return `<tr>
@@ -941,6 +1094,8 @@ function gerarPDF() {
       .summary-box .value { font-size: 18px; font-weight: 700; margin-top: 2px; }
       .highlight-box { background: #e8f5e9; border-color: #4caf50; }
       .highlight-box .value { color: #2e7d32; }
+      .warn-box { background: #fff3e0; border-color: #ff9800; }
+      .warn-box .value { color: #e65100; }
     </style>
   </head><body>
     <h1>🚛 PLANILHA CAMINHÃO — ${data.config.motorista}</h1>
@@ -965,11 +1120,13 @@ function gerarPDF() {
       <div class="summary-box"><div class="label">Total Diárias</div><div class="value">R$ ${totalDiarias.toFixed(2)}</div></div>
       <div class="summary-box"><div class="label">Total Diesel</div><div class="value">R$ ${totalDiesel.toFixed(2)}</div></div>
       ${adiantamento > 0 ? `<div class="summary-box"><div class="label">Adiantamento</div><div class="value">R$ ${adiantamento.toFixed(2)}</div></div>` : ''}
+      ${parcela ? `<div class="summary-box warn-box"><div class="label">Parcela Caminhão (${parcela.numero}/${parcela.total})</div><div class="value">R$ ${parcela.valor.toFixed(2)}</div></div>` : ''}
       <div class="summary-box"><div class="label">Total Rodado</div><div class="value">${totalRodado.toFixed(0)} km</div></div>
-      <div class="summary-box"><div class="label">Dias Trabalhados</div><div class="value">${q.records.length}</div></div>
+      <div class="summary-box"><div class="label">Dias Trabalhados</div><div class="value">${completos.length}</div></div>
       <div class="summary-box"><div class="label">Média KM Adic./Dia</div><div class="value">${mediaKmAdicional.toFixed(1)}</div></div>
       <div class="summary-box"><div class="label">Média Diária</div><div class="value">R$ ${mediaDiaria.toFixed(2)}</div></div>
       ${totalLitros > 0 ? `<div class="summary-box"><div class="label">Média KM/Litro</div><div class="value">${mediaKmLitro.toFixed(2)}</div></div>` : ''}
+      ${fifoKmL !== null ? `<div class="summary-box"><div class="label">Média KM/Litro (FIFO)</div><div class="value">${fifoKmL.toFixed(2)}</div></div>` : ''}
     </div>
   </body></html>`;
 
@@ -1039,23 +1196,24 @@ function renderConfig() {
     </div>
 
     <div class="card">
-      <div class="card-title">💾 Backup</div>
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;padding:12px;background:var(--surface2);border-radius:10px;">
+      <div class="card-title">📱 Enviar pelo WhatsApp</div>
+      <p class="settings-note">Envia o resumo da quinzena pelo WhatsApp. Útil pra abrir no computador e imprimir.</p>
+      <div style="margin-top:8px">
+        <button class="btn btn-primary" onclick="sendBackupWhatsApp()">📱 Enviar pelo WhatsApp</button>
+      </div>
+      <div style="margin-top:12px;display:flex;align-items:center;justify-content:space-between;padding:12px;background:var(--surface2);border-radius:10px;">
         <div>
-          <div style="font-size:13px;font-weight:600;color:var(--text)">Backup automático</div>
+          <div style="font-size:13px;font-weight:600;color:var(--text)">Lembrete automático</div>
           <div style="font-size:11px;color:var(--text2)">Avisa a cada 3 dias pra enviar</div>
         </div>
         <label style="position:relative;display:inline-block;width:50px;height:28px;cursor:pointer;">
-          <input type="checkbox" id="cfgAutoBackup" ${data.config.autoBackup !== false ? 'checked' : ''} onchange="toggleAutoBackup()" style="opacity:0;width:0;height:0;">
-          <span style="position:absolute;top:0;left:0;right:0;bottom:0;background:${data.config.autoBackup !== false ? 'var(--green)' : 'var(--surface)'};border:1px solid var(--border);border-radius:28px;transition:0.3s;"></span>
-          <span style="position:absolute;top:3px;left:${data.config.autoBackup !== false ? '24px' : '3px'};width:22px;height:22px;background:white;border-radius:50%;transition:0.3s;"></span>
+          <input type="checkbox" id="cfgAutoBackup" ${data.config.autoBackup === true ? 'checked' : ''} onchange="toggleAutoBackup()" style="opacity:0;width:0;height:0;">
+          <span style="position:absolute;top:0;left:0;right:0;bottom:0;background:${data.config.autoBackup === true ? 'var(--green)' : 'var(--surface)'};border:1px solid var(--border);border-radius:28px;transition:0.3s;"></span>
+          <span style="position:absolute;top:3px;left:${data.config.autoBackup === true ? '24px' : '3px'};width:22px;height:22px;background:white;border-radius:50%;transition:0.3s;"></span>
         </label>
       </div>
-      <div style="margin-top:8px">
-        <button class="btn btn-primary" onclick="sendBackupWhatsApp()">📱 Enviar Backup pelo WhatsApp</button>
-      </div>
-      <div style="margin-top:8px">
-        <button class="btn btn-secondary" onclick="restoreBackup()">📥 Restaurar Backup</button>
+      <div style="margin-top:12px">
+        <button class="btn btn-secondary" onclick="restoreBackup()">📥 Restaurar de backup antigo</button>
       </div>
     </div>
   `;
