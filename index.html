@@ -466,16 +466,63 @@ firebase.initializeApp({
 });
 const db = firebase.firestore();
 
-// Generate or retrieve a unique device ID
-function getDeviceId() {
-  let id = localStorage.getItem('caminhao_device_id');
-  if (!id) {
-    id = 'dev_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
-    localStorage.setItem('caminhao_device_id', id);
+// ── Access Code System ──
+// Uses a user-chosen code as both device ID and encryption key base
+// This survives localStorage clears because the user can re-enter the code
+
+function getAccessCode() {
+  let code = localStorage.getItem('caminhao_access_code');
+  if (code) return code;
+  
+  while (true) {
+    code = prompt('Crie um codigo de acesso para seus dados.\nUse algo facil de lembrar (ex: sua placa, seu nome, etc).\n\nSe ja tem um codigo, digite ele aqui para recuperar seus dados:');
+    if (code && code.trim().length >= 3) {
+      code = code.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (code.length >= 3) {
+        localStorage.setItem('caminhao_access_code', code);
+        return code;
+      }
+    }
+    alert('O codigo precisa ter pelo menos 3 letras ou numeros.');
   }
-  return id;
 }
-const DEVICE_ID = getDeviceId();
+const ACCESS_CODE = getAccessCode();
+const DEVICE_ID = 'user_' + ACCESS_CODE;
+
+// ── Encryption ──
+// Derives key from access code (deterministic, always the same for the same code)
+function getEncryptionKey() {
+  let key = '';
+  const base = ACCESS_CODE + '_caminhao_key_2024';
+  for (let i = 0; i < 64; i++) {
+    key += base.charCodeAt(i % base.length).toString(16).padStart(2, '0');
+  }
+  return key.substring(0, 64);
+}
+const ENC_KEY = getEncryptionKey();
+
+function encrypt(text) {
+  const key = ENC_KEY;
+  let result = '';
+  for (let i = 0; i < text.length; i++) {
+    const charCode = text.charCodeAt(i) ^ key.charCodeAt(i % key.length);
+    result += String.fromCharCode(charCode);
+  }
+  return btoa(unescape(encodeURIComponent(result)));
+}
+
+function decrypt(encoded) {
+  try {
+    const key = ENC_KEY;
+    const text = decodeURIComponent(escape(atob(encoded)));
+    let result = '';
+    for (let i = 0; i < text.length; i++) {
+      const charCode = text.charCodeAt(i) ^ key.charCodeAt(i % key.length);
+      result += String.fromCharCode(charCode);
+    }
+    return result;
+  } catch(e) { return null; }
+}
 
 // ── State ──
 let currentTab = 'registrar';
@@ -495,11 +542,11 @@ let cloudSaveTimeout = null;
 function saveToCloud() {
   if (cloudSaveTimeout) clearTimeout(cloudSaveTimeout);
   cloudSaveTimeout = setTimeout(() => {
+    const encrypted = encrypt(JSON.stringify(data));
     db.collection('caminhoes').doc(DEVICE_ID).set({
-      data: JSON.stringify(data),
-      updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
-      motorista: data.config.motorista,
-      placa: data.config.placa
+      data: encrypted,
+      encrypted: true,
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp()
     }).catch(err => console.log('Cloud save failed:', err));
   }, 2000);
 }
@@ -509,14 +556,54 @@ async function loadFromCloud() {
   try {
     const doc = await db.collection('caminhoes').doc(DEVICE_ID).get();
     if (doc.exists) {
-      const cloudData = JSON.parse(doc.data().data);
       const localStr = localStorage.getItem('caminhao_data');
       if (!localStr || localStr === 'null') {
+        let cloudData;
+        if (doc.data().encrypted) {
+          const decrypted = decrypt(doc.data().data);
+          if (!decrypted) { console.log('Decryption failed'); return; }
+          cloudData = JSON.parse(decrypted);
+        } else {
+          cloudData = JSON.parse(doc.data().data);
+        }
         data = cloudData;
         localStorage.setItem('caminhao_data', JSON.stringify(data));
         updateQuinzenaSelect();
         render();
         toast('Dados restaurados da nuvem!');
+      }
+    } else {
+      // Migration: try to find data from old random device ID
+      const localStr = localStorage.getItem('caminhao_data');
+      if (!localStr || localStr === 'null') {
+        try {
+          const snapshot = await db.collection('caminhoes').get();
+          if (!snapshot.empty) {
+            // Try each doc - find the one with valid data
+            for (const oldDoc of snapshot.docs) {
+              if (oldDoc.id === DEVICE_ID) continue;
+              try {
+                let oldData;
+                if (oldDoc.data().encrypted) {
+                  // Old encryption key won't work, but try unencrypted
+                  const raw = oldDoc.data().data;
+                  try { oldData = JSON.parse(raw); } catch(e) { continue; }
+                } else {
+                  oldData = JSON.parse(oldDoc.data().data);
+                }
+                if (oldData && oldData.quinzenas) {
+                  data = oldData;
+                  localStorage.setItem('caminhao_data', JSON.stringify(data));
+                  saveToCloud(); // Re-save under new ID
+                  updateQuinzenaSelect();
+                  render();
+                  toast('Dados antigos recuperados!');
+                  return;
+                }
+              } catch(e) { continue; }
+            }
+          }
+        } catch(e) { console.log('Migration failed:', e); }
       }
     }
   } catch(e) { console.log('Cloud load failed:', e); }
