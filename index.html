@@ -467,39 +467,115 @@ firebase.initializeApp({
 const db = firebase.firestore();
 
 // ── Access Code System ──
-// Uses a user-chosen code as both device ID and encryption key base
-// This survives localStorage clears because the user can re-enter the code
+// Triple redundancy: localStorage + cookie + IndexedDB
+// If ANY of the three survives browser cleanup, the code persists
 
-function getAccessCode() {
+function setCookie(name, value, days) {
+  const d = new Date();
+  d.setTime(d.getTime() + (days * 24 * 60 * 60 * 1000));
+  document.cookie = name + '=' + encodeURIComponent(value) + ';expires=' + d.toUTCString() + ';path=/;SameSite=Lax';
+}
+
+function getCookie(name) {
+  const v = document.cookie.match('(^|;)\\s*' + name + '\\s*=\\s*([^;]+)');
+  return v ? decodeURIComponent(v.pop()) : null;
+}
+
+function setIDB(key, value) {
+  try {
+    const req = indexedDB.open('caminhao_db', 1);
+    req.onupgradeneeded = (e) => { e.target.result.createObjectStore('config'); };
+    req.onsuccess = (e) => {
+      const db2 = e.target.result;
+      const tx = db2.transaction('config', 'readwrite');
+      tx.objectStore('config').put(value, key);
+    };
+  } catch(e) {}
+}
+
+function getIDB(key) {
+  return new Promise((resolve) => {
+    try {
+      const req = indexedDB.open('caminhao_db', 1);
+      req.onupgradeneeded = (e) => { e.target.result.createObjectStore('config'); };
+      req.onsuccess = (e) => {
+        const db2 = e.target.result;
+        const tx = db2.transaction('config', 'readonly');
+        const get = tx.objectStore('config').get(key);
+        get.onsuccess = () => resolve(get.result || null);
+        get.onerror = () => resolve(null);
+      };
+      req.onerror = () => resolve(null);
+    } catch(e) { resolve(null); }
+  });
+}
+
+function saveCodeEverywhere(code) {
+  localStorage.setItem('caminhao_access_code', code);
+  setCookie('caminhao_access_code', code, 3650); // 10 years
+  setIDB('access_code', code);
+}
+
+async function getAccessCodeAsync() {
+  // Try localStorage first (fastest)
   let code = localStorage.getItem('caminhao_access_code');
-  if (code) return code;
   
+  // Try cookie
+  if (!code) {
+    code = getCookie('caminhao_access_code');
+    if (code) localStorage.setItem('caminhao_access_code', code);
+  }
+  
+  // Try IndexedDB
+  if (!code) {
+    code = await getIDB('access_code');
+    if (code) localStorage.setItem('caminhao_access_code', code);
+  }
+  
+  // If found in any source, re-save everywhere for redundancy
+  if (code) {
+    saveCodeEverywhere(code);
+    return code;
+  }
+  
+  // Nothing found anywhere — ask user
   while (true) {
     code = prompt('Crie um codigo de acesso para seus dados.\nUse algo facil de lembrar (ex: sua placa, seu nome, etc).\n\nSe ja tem um codigo, digite ele aqui para recuperar seus dados:');
     if (code && code.trim().length >= 3) {
       code = code.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
       if (code.length >= 3) {
-        localStorage.setItem('caminhao_access_code', code);
+        saveCodeEverywhere(code);
         return code;
       }
     }
     alert('O codigo precisa ter pelo menos 3 letras ou numeros.');
   }
 }
-const ACCESS_CODE = getAccessCode();
-const DEVICE_ID = 'user_' + ACCESS_CODE;
 
-// ── Encryption ──
-// Derives key from access code (deterministic, always the same for the same code)
-function getEncryptionKey() {
+// ── Boot ──
+// Must use async init because IndexedDB is async
+let ACCESS_CODE, DEVICE_ID, ENC_KEY;
+
+async function boot() {
+  ACCESS_CODE = await getAccessCodeAsync();
+  DEVICE_ID = 'user_' + ACCESS_CODE;
+  
+  // Derive encryption key from access code (deterministic)
   let key = '';
   const base = ACCESS_CODE + '_caminhao_key_2024';
   for (let i = 0; i < 64; i++) {
     key += base.charCodeAt(i % base.length).toString(16).padStart(2, '0');
   }
-  return key.substring(0, 64);
+  ENC_KEY = key.substring(0, 64);
+  
+  // Load local data first (fast)
+  loadData();
+  initQuinzena();
+  render();
+  
+  // Then sync from cloud (async, will re-render if needed)
+  await loadFromCloud();
 }
-const ENC_KEY = getEncryptionKey();
 
 function encrypt(text) {
   const key = ENC_KEY;
@@ -526,14 +602,35 @@ function decrypt(encoded) {
 
 // ── State ──
 let currentTab = 'registrar';
-let data = JSON.parse(localStorage.getItem('caminhao_data') || 'null') || {
+let data = {
   config: { placa: 'ABC1D23', motorista: 'MOTORISTA', kmBase: 100, valorKm: 2, diariaDefault: 460, adiantamento: 0 },
   quinzenas: [],
   currentQ: null
 };
 
+function loadData() {
+  const saved = localStorage.getItem('caminhao_data');
+  if (saved && saved !== 'null') {
+    try { data = JSON.parse(saved); } catch(e) {}
+  }
+}
+
+// Try loading from IndexedDB if localStorage was empty
+async function loadDataFromIDB() {
+  if (localStorage.getItem('caminhao_data') && localStorage.getItem('caminhao_data') !== 'null') return;
+  const idbData = await getIDB('caminhao_data');
+  if (idbData) {
+    try {
+      data = JSON.parse(idbData);
+      localStorage.setItem('caminhao_data', JSON.stringify(data));
+      render();
+    } catch(e) {}
+  }
+}
+
 function save() {
   localStorage.setItem('caminhao_data', JSON.stringify(data));
+  setIDB('caminhao_data', JSON.stringify(data));
   saveToCloud();
   checkAutoBackup();
 }
@@ -551,13 +648,19 @@ function saveToCloud() {
   }, 2000);
 }
 
-// Load from cloud on first visit (if local is empty)
+// Load from cloud — always tries to sync
 async function loadFromCloud() {
+  // First try IDB recovery
+  await loadDataFromIDB();
+  
   try {
     const doc = await db.collection('caminhoes').doc(DEVICE_ID).get();
     if (doc.exists) {
       const localStr = localStorage.getItem('caminhao_data');
-      if (!localStr || localStr === 'null') {
+      const hasLocalData = localStr && localStr !== 'null' && JSON.parse(localStr).quinzenas && JSON.parse(localStr).quinzenas.length > 0;
+      
+      if (!hasLocalData) {
+        // Local is empty, restore from cloud
         let cloudData;
         if (doc.data().encrypted) {
           const decrypted = decrypt(doc.data().data);
@@ -568,6 +671,7 @@ async function loadFromCloud() {
         }
         data = cloudData;
         localStorage.setItem('caminhao_data', JSON.stringify(data));
+        setIDB('caminhao_data', JSON.stringify(data));
         updateQuinzenaSelect();
         render();
         toast('Dados restaurados da nuvem!');
@@ -608,7 +712,7 @@ async function loadFromCloud() {
     }
   } catch(e) { console.log('Cloud load failed:', e); }
 }
-loadFromCloud();
+// loadFromCloud is called by boot()
 
 function checkAutoBackup() {
   if (data.config.autoBackup !== true) return;
@@ -765,21 +869,20 @@ function updateQuinzenaSelect() {
   ).join('');
 }
 
-// ── Init ──
-if (data.quinzenas.length === 0) {
-  // Auto-create first quinzena based on current date
-  const now = new Date();
-  const half = now.getDate() <= 15 ? 1 : 2;
-  const month = now.getMonth();
-  const year = now.getFullYear();
-  const monthNames = ['jan','fev','mar','abr','mai','jun','jul','ago','set','out','nov','dez'];
-  const endDay = new Date(year, month + 1, 0).getDate();
-  const label = half === 1 ? `1ª Quinz. ${monthNames[month]} ${year} (01-15)` : `2ª Quinz. ${monthNames[month]} ${year} (16-${endDay})`;
-  data.quinzenas.push({ label, records: [], abastecimentos: [], month, year, half });
-  data.currentQ = 0;
-  save();
-  updateQuinzenaSelect();
-} else {
+// ── Init Quinzena ──
+function initQuinzena() {
+  if (data.quinzenas.length === 0) {
+    const now = new Date();
+    const half = now.getDate() <= 15 ? 1 : 2;
+    const month = now.getMonth();
+    const year = now.getFullYear();
+    const monthNames = ['jan','fev','mar','abr','mai','jun','jul','ago','set','out','nov','dez'];
+    const endDay = new Date(year, month + 1, 0).getDate();
+    const label = half === 1 ? `1ª Quinz. ${monthNames[month]} ${year} (01-15)` : `2ª Quinz. ${monthNames[month]} ${year} (16-${endDay})`;
+    data.quinzenas.push({ label, records: [], abastecimentos: [], month, year, half });
+    data.currentQ = 0;
+    save();
+  }
   updateQuinzenaSelect();
 }
 
@@ -1407,8 +1510,8 @@ function clearAll() {
   }
 }
 
-// ── Init render ──
-render();
+// ── Init ──
+boot();
 </script>
 </body>
 </html>
