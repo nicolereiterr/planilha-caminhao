@@ -615,13 +615,6 @@ function loadData() {
   if (saved && saved !== 'null') {
     try { data = JSON.parse(saved); } catch(e) {}
   }
-  // Garante ordenação dos dados carregados (dados antigos podem estar fora de ordem)
-  if (data.quinzenas) {
-    data.quinzenas.forEach(q => {
-      if (q.records) q.records.sort((a, b) => a.date.localeCompare(b.date));
-      if (q.abastecimentos) q.abastecimentos.sort((a, b) => a.date.localeCompare(b.date));
-    });
-  }
 }
 
 // Try loading from IndexedDB if localStorage was empty
@@ -638,11 +631,6 @@ async function loadDataFromIDB() {
 }
 
 function save() {
-  // Ordena registros e abastecimentos por data (ascendente) antes de salvar
-  data.quinzenas.forEach(q => {
-    if (q.records) q.records.sort((a, b) => a.date.localeCompare(b.date));
-    if (q.abastecimentos) q.abastecimentos.sort((a, b) => a.date.localeCompare(b.date));
-  });
   localStorage.setItem('caminhao_data', JSON.stringify(data));
   setIDB('caminhao_data', JSON.stringify(data));
   saveToCloud();
@@ -1361,10 +1349,9 @@ function gerarPDF(qIndex) {
   const q = data.quinzenas[qi];
   if (!q) return;
 
-  const completos = q.records.filter(r => !r.parcial).sort((a,b) => a.date.localeCompare(b.date));
+  const completos = q.records.filter(r => !r.parcial);
   const totalDiarias = completos.reduce((s, r) => s + r.total, 0);
-  const abastOrdenados = [...q.abastecimentos].sort((a,b) => a.date.localeCompare(b.date));
-  const totalDiesel = abastOrdenados.reduce((s, a) => s + a.valorTotal, 0);
+  const totalDiesel = q.abastecimentos.reduce((s, a) => s + a.valorTotal, 0);
   const adiantamento = data.config.adiantamento || 0;
   const parcela = getParcelaInfo(q);
   const parcelaValor = parcela ? parcela.valor : 0;
@@ -1390,7 +1377,7 @@ function gerarPDF(qIndex) {
     </tr>`;
   }).join('');
 
-  let fuelRows = abastOrdenados.map(a => {
+  let fuelRows = q.abastecimentos.map(a => {
     const d = new Date(a.date + 'T12:00:00');
     const dateStr = d.toLocaleDateString('pt-BR');
     return `<tr>
@@ -1520,6 +1507,15 @@ function renderConfig() {
     </div>
 
     <div class="card">
+      <div class="card-title">🔍 Recuperar Dados Perdidos</div>
+      <p class="settings-note">Busca dados antigos salvos na nuvem que podem ter sido perdidos.</p>
+      <div style="margin-top:8px">
+        <button class="btn btn-primary" onclick="searchLostData()">Buscar dados na nuvem</button>
+      </div>
+      <div id="recoveryResults" style="margin-top:12px"></div>
+    </div>
+
+    <div class="card">
       <div class="card-title">📱 Enviar pelo WhatsApp</div>
       <p class="settings-note">Envia o resumo da quinzena pelo WhatsApp. Útil pra abrir no computador e imprimir.</p>
       <div style="margin-top:8px">
@@ -1590,6 +1586,131 @@ function clearAll() {
   if (confirm('APAGAR TUDO? Essa ação não pode ser desfeita!')) {
     localStorage.removeItem('caminhao_data');
     location.reload();
+  }
+}
+
+// ── Recovery: search all Firebase documents for lost data ──
+async function searchLostData() {
+  const results = document.getElementById('recoveryResults');
+  results.innerHTML = '<p style="color:var(--text2);font-size:13px">Buscando dados na nuvem...</p>';
+  
+  try {
+    const snapshot = await db.collection('caminhoes').get();
+    
+    if (snapshot.empty) {
+      results.innerHTML = '<p style="color:var(--text2);font-size:13px">Nenhum dado encontrado na nuvem.</p>';
+      return;
+    }
+    
+    let html = '';
+    let found = 0;
+    
+    for (const doc of snapshot.docs) {
+      let docData = null;
+      let source = doc.id === DEVICE_ID ? ' (codigo atual)' : ' (codigo antigo)';
+      
+      // Try to decrypt with current key
+      try {
+        if (doc.data().encrypted) {
+          const decrypted = decrypt(doc.data().data);
+          if (decrypted) {
+            docData = JSON.parse(decrypted);
+          }
+        } else {
+          docData = JSON.parse(doc.data().data);
+        }
+      } catch(e) {}
+      
+      // Try to parse as raw JSON if decryption failed
+      if (!docData) {
+        try {
+          docData = JSON.parse(doc.data().data);
+        } catch(e) {}
+      }
+      
+      if (docData && docData.quinzenas) {
+        found++;
+        const totalQ = docData.quinzenas.length;
+        const totalRecords = docData.quinzenas.reduce((s, q) => s + (q.records ? q.records.length : 0), 0);
+        const totalFuel = docData.quinzenas.reduce((s, q) => s + (q.abastecimentos ? q.abastecimentos.length : 0), 0);
+        const qNames = docData.quinzenas.map(q => q.label).join(', ');
+        
+        html += `
+          <div style="background:var(--surface2);border-radius:10px;padding:12px;margin-bottom:8px;border:1px solid var(--border)">
+            <div style="font-size:13px;font-weight:600;color:var(--text)">Dados encontrados${source}</div>
+            <div style="font-size:12px;color:var(--text2);margin-top:4px">
+              ${totalQ} quinzena(s): ${qNames}<br>
+              ${totalRecords} viagem(ns), ${totalFuel} abastecimento(s)
+            </div>
+            <button class="btn btn-primary btn-small" style="margin-top:8px" onclick="recoverData('${doc.id}')">Recuperar estes dados</button>
+          </div>`;
+      }
+    }
+    
+    if (found === 0) {
+      results.innerHTML = '<p style="color:var(--text2);font-size:13px">Dados encontrados na nuvem, mas nao foi possivel descriptografar. Os dados foram salvos com uma chave antiga que se perdeu.</p>';
+    } else {
+      results.innerHTML = html;
+    }
+  } catch(e) {
+    results.innerHTML = '<p style="color:var(--red);font-size:13px">Erro ao buscar: ' + e.message + '</p>';
+  }
+}
+
+async function recoverData(docId) {
+  try {
+    const doc = await db.collection('caminhoes').doc(docId).get();
+    let docData = null;
+    
+    try {
+      if (doc.data().encrypted) {
+        const decrypted = decrypt(doc.data().data);
+        if (decrypted) docData = JSON.parse(decrypted);
+      } else {
+        docData = JSON.parse(doc.data().data);
+      }
+    } catch(e) {}
+    
+    if (!docData) {
+      try { docData = JSON.parse(doc.data().data); } catch(e) {}
+    }
+    
+    if (!docData || !docData.quinzenas) {
+      toast('Erro ao recuperar dados');
+      return;
+    }
+    
+    // Merge: add quinzenas that don't exist locally
+    let added = 0;
+    for (const cloudQ of docData.quinzenas) {
+      const exists = data.quinzenas.some(localQ => localQ.label === cloudQ.label);
+      if (!exists) {
+        data.quinzenas.push(cloudQ);
+        added++;
+      } else {
+        // If exists but cloud has more records, replace
+        const localQ = data.quinzenas.find(lq => lq.label === cloudQ.label);
+        const localRecords = (localQ.records ? localQ.records.length : 0) + (localQ.abastecimentos ? localQ.abastecimentos.length : 0);
+        const cloudRecords = (cloudQ.records ? cloudQ.records.length : 0) + (cloudQ.abastecimentos ? cloudQ.abastecimentos.length : 0);
+        if (cloudRecords > localRecords) {
+          const idx = data.quinzenas.indexOf(localQ);
+          data.quinzenas[idx] = cloudQ;
+          added++;
+        }
+      }
+    }
+    
+    // Also recover config if current is default
+    if (data.config.placa === 'ABC1D23' && docData.config && docData.config.placa !== 'ABC1D23') {
+      data.config = docData.config;
+    }
+    
+    save();
+    updateQuinzenaSelect();
+    render();
+    toast(added > 0 ? `${added} quinzena(s) recuperada(s)!` : 'Dados ja estavam atualizados');
+  } catch(e) {
+    toast('Erro ao recuperar: ' + e.message);
   }
 }
 
